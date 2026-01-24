@@ -6,4 +6,5 @@ configs.yaml
 
 # dir dataset
 data/coco/train2017_20k
-data/coco/val2017*.pth
+data/coco/val2017
+checkpoints/
