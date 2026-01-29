@@ -1,30 +1,29 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision.models import resnet50, ResNet50_Weights
 
 
 class ResNetBackbone(nn.Module):
     def __init__(self, pretrained=True):
         super().__init__()
-        if pretrained:
-            resnet = resnet50(weights=ResNet50_Weights.DEFAULT)
-        else:
-            resnet = resnet50(weights=None)
+        weights = ResNet50_Weights.DEFAULT if pretrained else None
+        resnet = resnet50(weights=weights)
 
         self.stage1 = nn.Sequential(
             resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool
-        )  # /4
+        )
+        self.stage2 = resnet.layer1  # /4   (256)
+        self.stage3 = resnet.layer2  # /8   (512)
+        self.stage4 = resnet.layer3  # /16  (1024)
+        self.stage5 = resnet.layer4  # /32  (2048)
 
-        self.stage2 = resnet.layer1  # C2 (/4)
-        self.stage3 = resnet.layer2  # C3 (/8)
-        self.stage4 = resnet.layer3  # C4 (/16)
-        self.stage5 = resnet.layer4  # C5 (/32)
+        # FREEZE stage1, stage2
+        for p in self.stage1.parameters():
+            p.requires_grad = False
 
-        # Freeze Stage 1 và Stage 2
-        for param in self.stage1.parameters():
-            param.requires_grad = False
-        for param in self.stage2.parameters():
-            param.requires_grad = False
+        for p in self.stage2.parameters():
+            p.requires_grad = False
 
     def forward(self, x):
         x = self.stage1(x)
@@ -32,123 +31,114 @@ class ResNetBackbone(nn.Module):
         c3 = self.stage3(c2)
         c4 = self.stage4(c3)
         c5 = self.stage5(c4)
-
         return c3, c4, c5
+
+
+import torch.nn.functional as F
 
 
 class FPN(nn.Module):
     def __init__(self, in_channels=[512, 1024, 2048], out_channels=256):
         super().__init__()
 
-        # Lateral convolutions: đưa feature maps từ backbone
-        # về cùng số kênh (out_channels)
-        self.lateral3 = nn.Conv2d(in_channels[0], out_channels, 1)
-        self.lateral4 = nn.Conv2d(in_channels[1], out_channels, 1)
         self.lateral5 = nn.Conv2d(in_channels[2], out_channels, 1)
+        self.lateral4 = nn.Conv2d(in_channels[1], out_channels, 1)
+        self.lateral3 = nn.Conv2d(in_channels[0], out_channels, 1)
 
-        # Smooth convolutions: làm mượt feature maps sau khi fusion
-        self.smooth3 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
-        self.smooth4 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
         self.smooth5 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+        self.smooth4 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+        self.smooth3 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
 
     def forward(self, c3, c4, c5):
         p5 = self.lateral5(c5)
+        p4 = self.lateral4(c4) + F.interpolate(p5, size=c4.shape[2:], mode="nearest")
+        p3 = self.lateral3(c3) + F.interpolate(p4, size=c3.shape[2:], mode="nearest")
 
-        p4 = self.lateral4(c4) + nn.functional.interpolate(
-            p5, size=c4.shape[2:], mode="nearest"
+        return (
+            self.smooth3(p3),
+            self.smooth4(p4),
+            self.smooth5(p5),
         )
 
-        p3 = self.lateral3(c3) + nn.functional.interpolate(
-            p4, size=c3.shape[2:], mode="nearest"
-        )
 
-        p3 = self.smooth3(p3)
-        p4 = self.smooth4(p4)
-        p5 = self.smooth5(p5)
-
-        return p3, p4, p5
-
-
-class YOLOHead(nn.Module):
-    def __init__(self, num_classes=80, in_channels=256, num_layers=2):
+class FPN(nn.Module):
+    def __init__(self, in_channels=[512, 1024, 2048], out_channels=256):
         super().__init__()
 
-        # 1. Nhánh Phân loại (Classification Branch)
-        # semantic
+        self.lateral5 = nn.Conv2d(in_channels[2], out_channels, 1)
+        self.lateral4 = nn.Conv2d(in_channels[1], out_channels, 1)
+        self.lateral3 = nn.Conv2d(in_channels[0], out_channels, 1)
+
+        self.smooth5 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+        self.smooth4 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+        self.smooth3 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+
+    def forward(self, c3, c4, c5):
+        p5 = self.lateral5(c5)
+        p4 = self.lateral4(c4) + F.interpolate(p5, size=c4.shape[2:], mode="nearest")
+        p3 = self.lateral3(c3) + F.interpolate(p4, size=c3.shape[2:], mode="nearest")
+
+        return (
+            self.smooth3(p3),
+            self.smooth4(p4),
+            self.smooth5(p5),
+        )
+
+
+class DecoupledHead(nn.Module):
+    def __init__(self, num_classes=10, in_channels=256):
+        super().__init__()
+
         self.cls_convs = nn.Sequential(
-            *[
-                nn.Sequential(
-                    nn.Conv2d(in_channels, in_channels, 3, padding=1, bias=False),
-                    nn.BatchNorm2d(in_channels),
-                    nn.SiLU(),
-                )
-                for _ in range(num_layers)
-            ]
+            nn.Conv2d(in_channels, in_channels, 3, padding=1),
+            nn.BatchNorm2d(in_channels),
+            nn.SiLU(),
+            nn.Conv2d(in_channels, in_channels, 3, padding=1),
+            nn.BatchNorm2d(in_channels),
+            nn.SiLU(),
         )
-        self.cls_pred = nn.Conv2d(in_channels, num_classes, 3, padding=1)
+        self.cls_pred = nn.Conv2d(in_channels, num_classes, 1)
 
-        # 2. Nhánh Định vị (Regression Branch)
-        # geometric
         self.reg_convs = nn.Sequential(
-            *[
-                nn.Sequential(
-                    nn.Conv2d(in_channels, in_channels, 3, padding=1, bias=False),
-                    nn.BatchNorm2d(in_channels),
-                    nn.SiLU(),
-                )
-                for _ in range(num_layers)
-            ]
+            nn.Conv2d(in_channels, in_channels, 3, padding=1),
+            nn.BatchNorm2d(in_channels),
+            nn.SiLU(),
+            nn.Conv2d(in_channels, in_channels, 3, padding=1),
+            nn.BatchNorm2d(in_channels),
+            nn.SiLU(),
         )
-        self.reg_pred = nn.Conv2d(in_channels, 4, 3, padding=1)
+        self.reg_pred = nn.Conv2d(in_channels, 4, 1)
+        self.obj_pred = nn.Conv2d(in_channels, 1, 1)
 
-        # 3. Nhánh Objectness (Độ tin cậy có vật thể hay không)
-        self.obj_pred = nn.Conv2d(in_channels, 1, 3, padding=1)
+        self._init_bias()
 
-        self._init_weights()
-
-    def _init_weights(self):
-        # Khởi tạo bias cho classification & objectness
-        for m in [self.cls_pred, self.obj_pred]:
-            nn.init.constant_(m.bias, -4.59)  # type: ignore
-
-        # Khởi tạo weight cho các layer còn lại
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
-            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
+    def _init_bias(self):
+        nn.init.constant_(self.obj_pred.bias, -4.6)  # type: ignore
 
     def forward(self, x):
-        # Nhánh classification
-        x_cls = self.cls_convs(x)
-        cls_output = self.cls_pred(x_cls)
+        cls_feat = self.cls_convs(x)
+        reg_feat = self.reg_convs(x)
 
-        # Nhánh regression + objectness
-        x_reg = self.reg_convs(x)
-        reg_output = self.reg_pred(x_reg)
-        obj_output = self.obj_pred(x_reg)
+        cls_out = self.cls_pred(cls_feat)
+        reg_out = self.reg_pred(reg_feat)
+        obj_out = self.obj_pred(reg_feat)
 
-        return torch.cat([reg_output, obj_output, cls_output], dim=1)
+        return torch.cat([reg_out, obj_out, cls_out], dim=1)
 
 
 class Detector(nn.Module):
-    def __init__(self, backbone, fpn, num_classes=80):
+    def __init__(self, num_classes=10):
         super().__init__()
-        self.backbone = backbone
-        self.fpn = fpn
-        self.head = YOLOHead(num_classes=num_classes)
+        self.backbone = ResNetBackbone(pretrained=True)
+        self.fpn = FPN()
+        self.head = DecoupledHead(num_classes=num_classes)
 
     def forward(self, x):
-        # 1. Backbone Extraction
         c3, c4, c5 = self.backbone(x)
+        features = self.fpn(c3, c4, c5)
 
-        # 2. FPN Fusion
-        p3, p4, p5 = self.fpn(c3, c4, c5)
+        outputs = []
+        for feat in features:
+            outputs.append(self.head(feat))
 
-        # 3. Detection Head (Shared weights across levels)
-        out_p3 = self.head(p3)
-        out_p4 = self.head(p4)
-        out_p5 = self.head(p5)
-
-        return [out_p3, out_p4, out_p5]
+        return outputs  # [P3, P4, P5]

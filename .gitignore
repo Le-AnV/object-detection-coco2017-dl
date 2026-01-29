@@ -7,4 +7,15 @@ configs.yaml
 # dir dataset
 data/coco/train2017_20k
 data/coco/val2017
+data/coco/train2017_10cls
+data/coco/val2017_10cls
+data/coco/annotations/instances_train2017_10cls.json
+data/coco/annotations/instances_val2017_10cls.json
+
 checkpoints/
+
+data/coco/
+runs/
+*.pth
+*.zip
+

@@ -1,102 +1,87 @@
-from tqdm import tqdm
 import torch
-from torchmetrics.detection.mean_ap import MeanAveragePrecision
+import torchmetrics
+from tqdm import tqdm
 
-from utils.nms import non_max_suppression
-from utils.box_ops import decode_outputs
+from utils.post_process import post_process
 
 
-@torch.no_grad()
-def validate_one_epoch(model, loss_fn, data_loader, device, epoch):
+def val_one_epoch(model, loader, criterion, device, epoch):
     model.eval()
 
-    # Metric mAP (0.5:0.95)
-    metric = MeanAveragePrecision(
-        box_format="xyxy", iou_type="bbox", class_metrics=False
+    # 1. Setup Metric Calculator (torchmetrics)
+    map_metric = torchmetrics.detection.mean_ap.MeanAveragePrecision(  # type: ignore
+        class_metrics=False
     )
-    metric.to(device)
 
-    # Biến theo dõi loss
-    running_loss = 0.0
-    running_box = 0.0
-    running_obj = 0.0
-    running_cls = 0.0
-    num_batches = len(data_loader)
+    # 2. Setup Loss Accumulator
+    running_metrics = {"total_loss": 0, "box_loss": 0, "obj_loss": 0, "cls_loss": 0}
+    num_batches = len(loader)
 
-    pbar = tqdm(data_loader, desc=f"Val epoch {epoch}")
+    pbar = tqdm(loader, desc=f"Val Epoch {epoch}")
 
-    for images, targets in pbar:
-        images = images.to(device)
-        targets = targets.to(device)
-        B, C, H, W = images.shape
+    with torch.no_grad():
+        for imgs, targets in pbar:
+            imgs = imgs.to(device)
+            targets_tensor = targets.to(device)
 
-        # Forward
-        preds = model(images)
+            # --- A. Tính Loss (để vẽ biểu đồ so sánh train/val) ---
+            preds = model(imgs)
+            loss, loss_items = criterion(preds, targets_tensor)
 
-        # Tính loss
-        loss, loss_items = loss_fn(preds, targets)
+            for k, v in loss_items.items():
+                running_metrics[k] += v
 
-        running_loss += loss.item()
-        running_box += loss_items["box_loss"]
-        running_obj += loss_items["obj_loss"]
-        running_cls += loss_items["cls_loss"]
+            # --- B. Tính mAP ---
+            # 1. Post-process predictions (Raw Tensor -> Box Coordinates)
+            # Output: List[Dict{'boxes', 'scores', 'labels'}] (Pixel coords)
+            preds_processed = post_process(preds, conf_thres=0.001, iou_thres=0.6)
 
-        # Decode + NMS
-        raw_proposals = decode_outputs(preds, conf_thres=0.01)
-        final_preds = non_max_suppression(raw_proposals, iou_thres=0.5)
+            # 2. Prepare Targets for Metric (Convert Normalized Tensor -> Pixel Dict)
+            # Targets tensor: [idx, cls, x, y, w, h] -> List[Dict]
+            target_formatted = []
+            batch_size = imgs.shape[0]
+            _, _, H, W = imgs.shape
 
-        pred_list = []
-        target_list = []
+            for b in range(batch_size):
+                t = targets_tensor[targets_tensor[:, 0] == b]
 
-        for i in range(B):
-            # Predictions của ảnh i
-            p = final_preds[i]
-            pred_list.append(
-                {
-                    "boxes": p[:, :4],
-                    "scores": p[:, 4],
-                    "labels": p[:, 5].long(),
-                }
-            )
+                if len(t) > 0:
+                    # Normalized xywh -> Pixel xyxy
+                    boxes_norm = t[:, 2:6]
+                    cls_labels = t[:, 1].long()
 
-            # Targets của ảnh i
-            mask = targets[:, 0] == i
-            t_img = targets[mask]
+                    # cx,cy,w,h -> x1,y1,x2,y2 pixel
+                    boxes_pixel = boxes_norm.clone()
+                    boxes_pixel[:, 0] = (boxes_norm[:, 0] - boxes_norm[:, 2] / 2) * W
+                    boxes_pixel[:, 1] = (boxes_norm[:, 1] - boxes_norm[:, 3] / 2) * H
+                    boxes_pixel[:, 2] = (boxes_norm[:, 0] + boxes_norm[:, 2] / 2) * W
+                    boxes_pixel[:, 3] = (boxes_norm[:, 1] + boxes_norm[:, 3] / 2) * H
 
-            if len(t_img) > 0:
-                # cx,cy,w,h (0–1) -> x1,y1,x2,y2 (pixel)
-                cx = t_img[:, 2] * W
-                cy = t_img[:, 3] * H
-                w = t_img[:, 4] * W
-                h = t_img[:, 5] * H
+                    target_formatted.append(dict(boxes=boxes_pixel, labels=cls_labels))
+                else:
+                    target_formatted.append(
+                        dict(
+                            boxes=torch.tensor([]).to(device),
+                            labels=torch.tensor([]).to(device),
+                        )
+                    )
 
-                x1 = cx - w / 2
-                y1 = cy - h / 2
-                x2 = cx + w / 2
-                y2 = cy + h / 2
+            # 3. Update Metric state
+            map_metric.update(preds_processed, target_formatted)
 
-                t_boxes = torch.stack([x1, y1, x2, y2], dim=1)
-                t_labels = t_img[:, 1].long()
-            else:
-                t_boxes = torch.empty((0, 4), device=device)
-                t_labels = torch.empty((0,), device=device, dtype=torch.long)
+    # Tổng hợp kết quả
+    avg_loss_metrics = {k: v / num_batches for k, v in running_metrics.items()}
 
-            target_list.append({"boxes": t_boxes, "labels": t_labels})
+    # Tính mAP
+    map_results = map_metric.compute()
 
-        # Update mAP cho batch
-        metric.update(pred_list, target_list)
+    # Merge Loss dict và Map dict lại thành 1
+    final_metrics = {**avg_loss_metrics}
+    final_metrics["map_50"] = map_results["map_50"].item()
+    final_metrics["map"] = map_results["map"].item()  # mAP 0.5:0.95
 
-        pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+    print(
+        f"Val Epoch {epoch} | Loss: {final_metrics['total_loss']:.4f} | mAP50: {final_metrics['map_50']:.4f}"
+    )
 
-    # Tổng hợp metric cả epoch
-    metrics_result = metric.compute()
-    metric.reset()
-
-    return {
-        "total_loss": running_loss / num_batches,
-        "box_loss": running_box / num_batches,
-        "obj_loss": running_obj / num_batches,
-        "cls_loss": running_cls / num_batches,
-        "map_50": metrics_result["map_50"].item(),
-        "map": metrics_result["map"].item(),
-    }
+    return final_metrics

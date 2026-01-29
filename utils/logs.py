@@ -12,7 +12,7 @@ def log_to_tensorboard(writer, epoch, train_metrics, val_metrics):
 
     writer.add_scalars(
         "Loss/Box",
-        {"train": train_metrics["box_loss"], "val": val_metrics["box_loss"]},
+        {"train": train_metrics["box_loss"], "v al": val_metrics["box_loss"]},
         epoch,
     )
 
