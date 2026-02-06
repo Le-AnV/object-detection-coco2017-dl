@@ -8,9 +8,10 @@ class ComputeLoss(nn.Module):
         super().__init__()
         self.num_classes = num_classes
 
-        # Feature strides tương ứng P3, P4, P5
+        # Stride tương ứng các feature map P3, P4, P5
         self.strides = [8, 16, 32]
 
+        # Hệ số trọng số cho từng thành phần loss
         self.box_gain = 0.1
         self.cls_gain = 0.5
         self.obj_gain = 0.7
@@ -21,9 +22,9 @@ class ComputeLoss(nn.Module):
 
     def forward(self, preds, targets):
         """
-        preds: list[P3, P4, P5]
-               mỗi phần tử shape [B, 5+num_classes, H, W]
-        targets: Tensor [N, 6] = [batch_idx, class, cx, cy, w, h] (normalized)
+        preds: danh sách [P3, P4, P5]
+               mỗi phần tử shape [B, 5 + num_classes, H, W]
+        targets: Tensor [N, 6] = batch_id, class, cx, cy, w, h (đã chuẩn hóa)
         """
         device = preds[0].device
         lbox = torch.zeros(1, device=device)
@@ -33,7 +34,7 @@ class ComputeLoss(nn.Module):
         tcls, tbox, indices = self.build_targets(preds, targets)
 
         for i, pi in enumerate(preds):
-            # pi: [B, C, H, W] → [B, 1, H, W, C]
+            # Đưa tensor về dạng [B, 1, H, W, C]
             pi = pi.permute(0, 2, 3, 1).unsqueeze(1)
 
             b, a, gj, gi = indices[i]
@@ -41,9 +42,9 @@ class ComputeLoss(nn.Module):
 
             n = b.shape[0]
             if n > 0:
-                ps = pi[b, a, gj, gi]  # [N, C]
+                ps = pi[b, a, gj, gi]
 
-                # -------- BOX REGRESSION --------
+                # Loss hồi quy bounding box
                 pxy = ps[:, 0:2].sigmoid() * 2.0 - 0.5
                 pwh = (ps[:, 2:4].sigmoid() * 2.0) ** 2
                 pbox = torch.cat((pxy, pwh), dim=1)
@@ -51,18 +52,20 @@ class ComputeLoss(nn.Module):
                 iou = self.bbox_iou(pbox, tbox[i], CIoU=True)
                 lbox += (1.0 - iou).mean()
 
-                # -------- OBJECTNESS --------
+                # Gán nhãn objectness theo IoU
                 tobj[b, a, gj, gi] = iou.detach().clamp(0).to(tobj.dtype)
 
-                # -------- CLASSIFICATION --------
+                # Loss phân lớp
                 if self.num_classes > 1:
                     t = torch.zeros_like(ps[:, 5:], device=device)
                     t[torch.arange(n), tcls[i]] = 1.0
                     lcls += self.BCEcls(ps[:, 5:], t).mean()
 
+            # Loss objectness trên toàn feature map
             obj_loss = self.BCEobj(pi[..., 4], tobj)
             lobj += obj_loss.mean() * self.balance[i]
 
+        # Tổng hợp loss
         total_loss = lbox * self.box_gain + lobj * self.obj_gain + lcls * self.cls_gain
 
         return total_loss, {
@@ -72,12 +75,14 @@ class ComputeLoss(nn.Module):
         }
 
     # ============================================================
-    # TARGET ASSIGNMENT (ANCHOR-FREE + OFFSET)
+    # GÁN NHÃN TARGET (ANCHOR-FREE + OFFSET)
     # ============================================================
     def build_targets(self, preds, targets):
         tcls, tbox, indices = [], [], []
 
         device = targets.device
+
+        # Các offset cho ô lân cận
         offsets = torch.tensor(
             [[0, 0], [1, 0], [0, 1], [-1, 0], [0, -1]],
             device=device,
@@ -116,7 +121,6 @@ class ComputeLoss(nn.Module):
                 gi_o, gj_o = gij_o[:, 0], gij_o[:, 1]
 
                 mask = (gi_o >= 0) & (gj_o >= 0) & (gi_o < w) & (gj_o < h)
-
                 if mask.sum() == 0:
                     continue
 
@@ -157,10 +161,11 @@ class ComputeLoss(nn.Module):
         return tcls, tbox, indices
 
     # ============================================================
-    # IOU (CIOU)
+    # TÍNH IOU (CIOU)
     # ============================================================
     @staticmethod
     def bbox_iou(box1, box2, CIoU=True, eps=1e-7):
+        # Chuyển từ cxcywh sang xyxy
         b1_x1 = box1[:, 0] - box1[:, 2] / 2
         b1_y1 = box1[:, 1] - box1[:, 3] / 2
         b1_x2 = box1[:, 0] + box1[:, 2] / 2
@@ -185,9 +190,11 @@ class ComputeLoss(nn.Module):
             cw = torch.max(b1_x2, b2_x2) - torch.min(b1_x1, b2_x1)
             ch = torch.max(b1_y2, b2_y2) - torch.min(b1_y1, b2_y1)
             c2 = cw**2 + ch**2 + eps
+
             rho2 = (box2[:, 0] - box1[:, 0]) ** 2 + (box2[:, 1] - box1[:, 1]) ** 2
 
             v = 4 / math.pi**2 * torch.pow(torch.atan(w2 / h2) - torch.atan(w1 / h1), 2)
+
             with torch.no_grad():
                 alpha = v / (v - iou + 1 + eps)
 
