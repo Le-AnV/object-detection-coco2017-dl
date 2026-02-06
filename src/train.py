@@ -1,41 +1,62 @@
-import torch
 from tqdm import tqdm
+import torch
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device, epoch):
+def train_one_epoch(
+    model,
+    optimizer,
+    loss_fn,
+    data_loader,
+    device,
+    epoch,
+    scaler,
+):
     model.train()
 
-    # Khởi tạo bộ đếm
-    running_metrics = {"total_loss": 0, "box_loss": 0, "obj_loss": 0, "cls_loss": 0}
-    num_batches = len(loader)
+    loss_sum = box_sum = obj_sum = cls_sum = 0.0
+    num_batches = len(data_loader)
 
-    pbar = tqdm(loader, desc=f"Train Epoch {epoch}")
+    pbar = tqdm(data_loader, desc=f"Train epoch {epoch}")
 
-    for imgs, targets in pbar:
-        imgs = imgs.to(device)
-        targets = targets.to(device)  # [idx, cls, x, y, w, h] normalized
+    for images, targets in pbar:
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
-        preds = model(imgs)
+        # -------- AMP FORWARD --------
+        with torch.autocast(device_type="cuda"):  # type: ignore
+            preds = model(images)
+            loss, loss_items = loss_fn(preds, targets)
 
-        # Nhận về total_loss và dictionary chi tiết
-        loss, loss_items = criterion(preds, targets)
+        # -------- AMP BACKWARD --------
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
-        loss.backward()
+        # -------- LOG --------
+        loss_val = loss.item()
+        box_val = loss_items["box"].item()
+        obj_val = loss_items["obj"].item()
+        cls_val = loss_items["cls"].item()
 
-        # Gradient Clipping (Quan trọng để tránh nổ gradient với ResNet)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)  # type: ignore
+        loss_sum += loss_val
+        box_sum += box_val
+        obj_sum += obj_val
+        cls_sum += cls_val
 
-        optimizer.step()
+        lr = optimizer.param_groups[0]["lr"]
+        pbar.set_postfix(
+            loss=f"{loss_val:.4f}",
+            box=f"{box_val:.4f}",
+            obj=f"{obj_val:.4f}",
+            cls=f"{cls_val:.4f}",
+            lr=f"{lr:.6f}",
+        )
 
-        # Cộng dồn metrics
-        for k, v in loss_items.items():
-            running_metrics[k] += v
-
-        # Update thanh progress bar
-        pbar.set_postfix(loss=loss.item())
-
-    # Tính trung bình cho cả epoch
-    avg_metrics = {k: v / num_batches for k, v in running_metrics.items()}
-    return avg_metrics
+    return {
+        "total_loss": loss_sum / num_batches,
+        "box_loss": box_sum / num_batches,
+        "obj_loss": obj_sum / num_batches,
+        "cls_loss": cls_sum / num_batches,
+    }
