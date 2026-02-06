@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torchvision.models import resnet50, ResNet50_Weights
 
 
+# Backbone
 class ResNetBackbone(nn.Module):
     def __init__(self, pretrained=True):
         super().__init__()
@@ -34,9 +35,7 @@ class ResNetBackbone(nn.Module):
         return c3, c4, c5
 
 
-import torch.nn.functional as F
-
-
+# Neck
 class FPN(nn.Module):
     def __init__(self, in_channels=[512, 1024, 2048], out_channels=256):
         super().__init__()
@@ -61,30 +60,7 @@ class FPN(nn.Module):
         )
 
 
-class FPN(nn.Module):
-    def __init__(self, in_channels=[512, 1024, 2048], out_channels=256):
-        super().__init__()
-
-        self.lateral5 = nn.Conv2d(in_channels[2], out_channels, 1)
-        self.lateral4 = nn.Conv2d(in_channels[1], out_channels, 1)
-        self.lateral3 = nn.Conv2d(in_channels[0], out_channels, 1)
-
-        self.smooth5 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
-        self.smooth4 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
-        self.smooth3 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
-
-    def forward(self, c3, c4, c5):
-        p5 = self.lateral5(c5)
-        p4 = self.lateral4(c4) + F.interpolate(p5, size=c4.shape[2:], mode="nearest")
-        p3 = self.lateral3(c3) + F.interpolate(p4, size=c3.shape[2:], mode="nearest")
-
-        return (
-            self.smooth3(p3),
-            self.smooth4(p4),
-            self.smooth5(p5),
-        )
-
-
+# Head YOLO-Style
 class DecoupledHead(nn.Module):
     def __init__(self, num_classes=10, in_channels=256):
         super().__init__()
