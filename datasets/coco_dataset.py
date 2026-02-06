@@ -12,7 +12,7 @@ class COCODataset(Dataset):
         self,
         img_dir: str,
         ann_file: str,
-        img_size: int = 640,
+        img_size: int = 224,
         transform=None,
         selected_cat_ids=None,
     ):
@@ -105,6 +105,8 @@ class COCODataset(Dataset):
     def __getitem__(self, idx):
         img_id = self.img_ids[idx]
         image, _ = self._load_image(img_id)
+
+        # Sử dụng kỹ thuật letterbox để resize image
         image, meta = letterbox(image, img_size=self.img_size)
         target = self._load_target(img_id, meta)
         image = torch.from_numpy(image).permute(2, 0, 1).float()
